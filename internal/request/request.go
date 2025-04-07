@@ -5,12 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+
+	"github.com/hconn7/httpfromtcp/internal/headers"
 )
 
 type Request struct {
-	RequestLine RequestLine
-	State       requestState
+	RequestLine    RequestLine
+	Headers        headers.Headers
+	Body           []byte
+	State          requestState
+	bodyLengthRead int
 }
 
 type RequestLine struct {
@@ -21,12 +27,30 @@ type RequestLine struct {
 
 const (
 	StateInit = iota
+	StateHeaders
+	StateBody
 	StateDone
 )
 
 type requestState int
 
 func (r *Request) parse(data []byte) (int, error) {
+	totalBytesParsed := 0
+	for r.State != StateDone {
+		n, err := r.parseSingle(data[totalBytesParsed:])
+		if err != nil {
+			return 0, err
+		}
+		totalBytesParsed += n
+		if n == 0 {
+			break
+		}
+
+	}
+	return totalBytesParsed, nil
+}
+
+func (r *Request) parseSingle(data []byte) (int, error) {
 	switch r.State {
 	case StateInit:
 		req, parsed, err := parseRequestLine(data)
@@ -37,8 +61,37 @@ func (r *Request) parse(data []byte) (int, error) {
 			return 0, nil
 		}
 		r.RequestLine = *req
-		r.State = StateDone
+		r.State = StateHeaders
 		return parsed, nil
+	case StateHeaders:
+		n, done, err := r.Headers.ParseHeaders(data)
+		if err != nil {
+			return 0, err
+		}
+		if done {
+			r.State = StateBody
+		}
+		return n, nil
+	case StateBody:
+		contentLenStr, ok := r.Headers.Get("Content-Length")
+		if !ok {
+			r.State = StateDone
+			return len(data), nil
+		}
+		contentLen, err := strconv.Atoi(contentLenStr)
+		if err != nil {
+			return 0, fmt.Errorf("malformed Content-Length: %s", err)
+		}
+		r.Body = append(r.Body, data...)
+		r.bodyLengthRead += len(data)
+		if r.bodyLengthRead > contentLen {
+			return 0, fmt.Errorf("Content-Length too large")
+		}
+		if r.bodyLengthRead == contentLen {
+			r.State = StateDone
+		}
+		return len(data), nil
+
 	}
 	return 0, nil
 }
@@ -49,7 +102,8 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 	readToIndex := 0
 
 	req := Request{
-		State: StateInit,
+		State:   StateInit,
+		Headers: headers.NewHeaders(),
 	}
 
 	for req.State != StateDone {
@@ -62,8 +116,10 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 		n, err := reader.Read(buf[readToIndex:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				req.State = StateDone
-				break
+				if req.State != StateDone {
+					return nil, errors.New("state not done")
+				}
+
 			}
 			return &Request{}, err
 		}
@@ -88,6 +144,9 @@ func parseRequestLine(data []byte) (*RequestLine, int, error) {
 	stringDat := string(s)
 
 	requestSplit := strings.Split(stringDat, " ")
+	if len(requestSplit) != 3 {
+		return nil, 0, errors.New("Malformed format")
+	}
 	reqMethod := strings.TrimSpace(requestSplit[0])
 	reqTarget := requestSplit[1]
 	reqVersion := requestSplit[2]
@@ -103,9 +162,10 @@ func parseRequestLine(data []byte) (*RequestLine, int, error) {
 			valid = true
 			break
 		}
-		if !valid {
-			return &RequestLine{}, 0, fmt.Errorf("Method is invalid: %s", reqMethod)
-		}
+	}
+	if !valid {
+		return &RequestLine{}, 0, fmt.Errorf("Method is invalid: %s", reqMethod)
+
 	}
 
 	return &RequestLine{
